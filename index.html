@@ -259,6 +259,8 @@ table.data tbody tr:hover { background: var(--teal-tint); }
 canvas.chart { display: block; width: 100%; height: 200px; touch-action: pan-y; }
 .graph-foot { display: flex; align-items: center; gap: 8px; padding: 7px 10px; border-top: 1px solid var(--border); flex-wrap: wrap; font-size: 12px; }
 .stats-readout { font-family: var(--font-mono); color: var(--teal-strong); font-size: 12px; }
+.fit-readout { font-family: var(--font-mono); color: var(--amber); font-size: 12px; }
+.readouts { display: flex; flex-direction: column; gap: 3px; }
 .pill { display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px; border-radius: 999px; background: var(--surface-2); font-size: 11px; color: var(--text-dim); }
 
 .graph-head-simple { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
@@ -342,6 +344,7 @@ input[type=file] { display: none; }
       <button class="btn ghost" data-mode="track" title="Mark the moving object on this frame">Mark dot</button>
       <button class="btn ghost" data-mode="calibrate" title="Show the app a real-world distance">Set ruler</button>
       <button class="btn ghost" data-mode="axes" title="Set where 0, 0 is">Set start</button>
+      <button class="btn ghost" data-mode="tape" title="Measure the distance between two points">Measure</button>
     </div>
 
     <div class="spacer"></div>
@@ -432,6 +435,7 @@ input[type=file] { display: none; }
     <div class="graph-modal-head">
       <span class="graph-modal-title mono" id="graphModalTitle"></span>
       <span class="stats-readout" id="graphModalStats"></span>
+      <span class="fit-readout" id="graphModalFitEq"></span>
       <div class="spacer"></div>
       <button class="btn sm" id="graphModalSave">Save image</button>
       <button class="icon-btn" id="graphModalClose" title="Close"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
@@ -670,7 +674,7 @@ const state = {
   currentFrame: 0,
   playing: false,
   playbackSpeed: 1,
-  mode: 'select', // select | track | calibrate | axes
+  mode: 'select', // select | track | calibrate | axes | tape
   autoAdvance: true,
 
   calibration: {
@@ -681,6 +685,8 @@ const state = {
 
   tracks: [],
   activeTrackId: null,
+
+  tape: { p1: null, p2: null }, // one-off distance measurement, independent of any track
 
   graphs: [], // { id, xKey, yKey, fit: 'none'|'linear'|'quadratic'|'cubic'|'sinusoidal'|'auto', roiMin, roiMax, roiPick:null }
 
@@ -961,19 +967,38 @@ videoEl.addEventListener('pause', () => { state.playing = false; $('playIcon').s
 function setMode(mode) {
   state.mode = mode;
   state.calibration.pendingStickClick = null;
+  state.tape.p1 = null; state.tape.p2 = null;
   document.querySelectorAll('#modeButtons .btn').forEach((b) => b.classList.toggle('accent', b.dataset.mode === mode));
   const banner = $('modeBanner');
   const labels = {
     select: '', track: 'Tap the moving thing on this frame',
     calibrate: 'Tap both ends of your ruler', axes: 'Tap where you want 0, 0 to be',
+    tape: tapeBannerText(),
   };
   if (mode === 'select' || !labels[mode]) { banner.classList.remove('show'); }
   else {
     banner.classList.add('show');
     $('modeBannerText').textContent = labels[mode];
-    $('modeBannerSwatch').style.background = mode === 'track' ? (activeTrack() ? activeTrack().color : '#999') : 'var(--amber)';
+    $('modeBannerSwatch').style.background = mode === 'track' ? (activeTrack() ? activeTrack().color : '#999') : (mode === 'tape' ? '#be4863' : 'var(--amber)');
   }
   redrawOverlay();
+  renderCalibrationPanel(); // keeps the Ruler tab's inline "tap the video" buttons in sync with the mode
+}
+
+// Text for the tape-measure mode banner — a live readout once both points
+// are tapped, using the calibrated scale when one's been set (falls back to
+// raw pixels otherwise, same as everywhere else in the app before calibration).
+function tapeBannerText() {
+  if (state.tape.p1 && state.tape.p2) {
+    let label = Math.hypot(state.tape.p2.x - state.tape.p1.x, state.tape.p2.y - state.tape.p1.y).toFixed(1) + ' px';
+    if (hasScaleCalibration()) {
+      const cal = getCalibrationObj();
+      const w1 = cal.pixelToWorld(state.tape.p1), w2 = cal.pixelToWorld(state.tape.p2);
+      label = Math.hypot(w2.x - w1.x, w2.y - w1.y).toFixed(4) + ' ' + state.calibration.unit;
+    }
+    return 'Distance: ' + label + '  ·  tap again to measure something else';
+  }
+  return 'Tap two points to measure the distance between them';
 }
 
 function onStageClick(evt) {
@@ -1000,6 +1025,12 @@ function onStageClick(evt) {
     redrawOverlay();
     refreshAll();
     autosaveSoon();
+  } else if (state.mode === 'tape') {
+    if (!state.tape.p1) { state.tape.p1 = vp; }
+    else if (!state.tape.p2) { state.tape.p2 = vp; }
+    else { state.tape.p1 = vp; state.tape.p2 = null; }
+    redrawOverlay();
+    $('modeBannerText').textContent = tapeBannerText();
   }
 }
 overlayCanvas.addEventListener('pointerdown', onStageClick);
@@ -1055,6 +1086,20 @@ function redrawOverlay() {
   } else if (c.pendingStickClick) {
     const p = videoPxToCss(c.pendingStickClick);
     drawCrossMark(p, dark ? '#e2a23d' : '#965e07');
+  }
+
+  // tape measure (one-off, independent of any track)
+  if (state.tape.p1 && state.tape.p2) {
+    const p1 = videoPxToCss(state.tape.p1), p2 = videoPxToCss(state.tape.p2);
+    let label = Math.hypot(state.tape.p2.x - state.tape.p1.x, state.tape.p2.y - state.tape.p1.y).toFixed(1) + ' px';
+    if (hasScaleCalibration()) {
+      const cal = getCalibrationObj();
+      const w1 = cal.pixelToWorld(state.tape.p1), w2 = cal.pixelToWorld(state.tape.p2);
+      label = Math.hypot(w2.x - w1.x, w2.y - w1.y).toFixed(4) + ' ' + c.unit;
+    }
+    drawMeasureLine(p1, p2, '#be4863', label);
+  } else if (state.tape.p1) {
+    drawCrossMark(videoPxToCss(state.tape.p1), '#be4863');
   }
 
   // tracks
@@ -1145,10 +1190,10 @@ function renderTracksPanel() {
     <h3 class="panel-h">What are you tracking?</h3>
     <div class="card">
       <label class="inline" style="margin-bottom:8px;"><input type="checkbox" id="autoAdvanceToggle" ${state.autoAdvance ? 'checked' : ''}> Jump to the next frame after each tap</label>
-      ${rows || '<div class="empty-note">No dots yet. Tap "+ Add a dot" below, then use the <b>Mark dot</b> button up top and tap the object on each frame of the video.</div>'}
+      ${rows || '<div class="empty-note">No dots yet. Tap "+ Add a dot" below, then tap the object on each frame of the video.</div>'}
     </div>
     <button class="btn sm" id="btnAddPointTrack" style="width:100%;">+ Add a dot</button>
-    <div class="help" style="margin-top:12px;">Pick a dot in the list, choose <b>Mark dot</b> above the video, then tap the object you're tracking on each frame. The dot you're currently marking is highlighted here and shown over the video.</div>
+    <div class="help" style="margin-top:12px;">Pick a dot in the list, then tap the object you're tracking on each frame of the video — the dot you're marking is highlighted here and shown over the video.</div>
   `;
 
   el.querySelectorAll('.track-row').forEach((row) => {
@@ -1156,7 +1201,7 @@ function renderTracksPanel() {
       if (e.target.closest('[data-action]')) return;
       state.activeTrackId = row.dataset.id;
       renderTracksPanel();
-      if (state.mode === 'track') setMode(state.mode);
+      setMode('track');
     });
   });
   el.querySelectorAll('[data-action="rename"]').forEach((inp) => {
@@ -1174,7 +1219,7 @@ function renderTracksPanel() {
   el.querySelectorAll('[data-action="del"]').forEach((b) => {
     b.addEventListener('click', () => deleteTrack(b.dataset.id));
   });
-  $('btnAddPointTrack').addEventListener('click', () => addTrack());
+  $('btnAddPointTrack').addEventListener('click', () => { addTrack(); setMode('track'); });
   $('autoAdvanceToggle').addEventListener('change', (e) => { state.autoAdvance = e.target.checked; updateTransportUI(); });
 }
 function escapeAttr(s) { return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;'); }
@@ -1194,8 +1239,9 @@ function renderCalibrationPanel() {
   el.innerHTML = `
     <h3 class="panel-h">Step 1: Set your ruler</h3>
     <div class="card">
-      <div class="step"><span class="n">1</span> Tap <b>Set ruler</b> up top, then tap both ends of a ruler or anything of known length in the video.</div>
+      <div class="step"><span class="n">1</span> Tap the button below, then tap both ends of a ruler or anything of known length in the video.</div>
       <div class="step"><span class="n">2</span> Type in how long that really is.</div>
+      <button class="btn sm ${state.mode === 'calibrate' ? 'accent' : ''}" id="btnStartRuler" style="width:100%; margin-bottom:10px;">${state.mode === 'calibrate' ? 'Tap the video now…' : 'Tap the video to mark the ruler'}</button>
       <div class="field-row">
         <span class="label">Real length</span>
         <div style="display:flex; gap:6px;">
@@ -1208,8 +1254,9 @@ function renderCalibrationPanel() {
 
     <h3 class="panel-h">Step 2: Set the starting point</h3>
     <div class="card">
-      <div class="step"><span class="n">1</span> Tap <b>Set start</b> up top and tap where you want 0, 0 to be — usually where the object starts moving.</div>
+      <div class="step"><span class="n">1</span> Tap the button below and tap where you want 0, 0 to be — usually where the object starts moving.</div>
       <div class="step"><span class="n">2</span> If the camera was tilted, straighten things out here.</div>
+      <button class="btn sm ${state.mode === 'axes' ? 'accent' : ''}" id="btnStartAxes" style="width:100%; margin-bottom:10px;">${state.mode === 'axes' ? 'Tap the video now…' : 'Tap the video to set 0, 0'}</button>
       <div class="field-row"><span class="label">Start point (px)</span><span class="readout">${c.originPx ? Math.round(c.originPx.x) + ', ' + Math.round(c.originPx.y) : '—'}</span></div>
       <div class="field-row">
         <span class="label">Tilt</span>
@@ -1221,6 +1268,8 @@ function renderCalibrationPanel() {
     </div>
     <div class="help">You can start marking dots before doing this — but do both steps to get real speeds and distances instead of just pixels.</div>
   `;
+  $('btnStartRuler').addEventListener('click', () => setMode('calibrate'));
+  $('btnStartAxes').addEventListener('click', () => setMode('axes'));
   $('calDistance').addEventListener('input', (e) => { c.knownDistance = parseFloat(e.target.value) || 0; renderCalibrationPanel(); refreshAll(); redrawOverlay(); autosaveSoon(); });
   $('calUnit').addEventListener('change', (e) => { c.unit = e.target.value; renderCalibrationPanel(); refreshAll(); redrawOverlay(); autosaveSoon(); });
   $('axisAngle').addEventListener('input', (e) => { c.thetaRad = (parseFloat(e.target.value) || 0) * Math.PI / 180; refreshAll(); redrawOverlay(); autosaveSoon(); });
@@ -1270,8 +1319,8 @@ const COLUMN_DEFS = {
 function columnUnitSuffix(track, key) {
   const u = unitsLabel();
   if (key === 't') return 's';
-  if (key === 'x' || key === 'y' || key === 'speed') return u;
-  if (key === 'vx' || key === 'vy') return u + '/s';
+  if (key === 'x' || key === 'y') return u;
+  if (key === 'vx' || key === 'vy' || key === 'speed') return u + '/s';
   if (key === 'ax' || key === 'ay') return u + '/s²';
   return '';
 }
@@ -1428,6 +1477,8 @@ function redrawGraphModal() {
   drawGraph(g, canvas);
   const cardReadout = document.querySelector(`.graph-card[data-id="${g.id}"] .stats-readout`);
   $('graphModalStats').textContent = cardReadout ? cardReadout.textContent : '';
+  const cardFitReadout = document.querySelector(`.graph-card[data-id="${g.id}"] .fit-readout`);
+  $('graphModalFitEq').textContent = cardFitReadout ? cardFitReadout.textContent : '';
   $('graphModalTitle').textContent = graphTitleText(g);
 }
 window.addEventListener('resize', () => { if (expandedGraphId) redrawGraphModal(); });
@@ -1455,7 +1506,7 @@ function exportGraphImage(canvas, g) {
 const QUICK_CHARTS = [
   { key: 'x', label: 'Left/right' },
   { key: 'y', label: 'Up/down' },
-  { key: 'speed', label: 'Speed' },
+  { key: 'speed', label: 'Speed', title: 'Overall speed — left/right and up/down motion combined into one number' },
 ];
 
 function graphCardHtml(g) {
@@ -1466,14 +1517,14 @@ function graphCardHtml(g) {
   return `<div class="graph-card" data-id="${g.id}">
     <div class="graph-head-simple">
       <div class="quick-charts">
-        ${QUICK_CHARTS.map((q) => `<button class="btn sm ${isPreset(q.key) ? 'accent' : 'ghost'}" data-preset="${q.key}">${q.label}</button>`).join('')}
+        ${QUICK_CHARTS.map((q) => `<button class="btn sm ${isPreset(q.key) ? 'accent' : 'ghost'}" data-preset="${q.key}"${q.title ? ` title="${escapeAttr(q.title)}"` : ''}>${q.label}</button>`).join('')}
       </div>
       <button class="icon-btn" data-action="expand" style="margin-left:auto;" title="Open larger">${expandSvg()}</button>
       <button class="icon-btn" data-action="savePng" title="Save graph as an image">${imageSvg()}</button>
       <button class="icon-btn" data-action="remove" title="Remove this graph">${trashSvg()}</button>
     </div>
     <div class="graph-canvas-wrap"><canvas class="chart"></canvas></div>
-    <div class="graph-foot"><span class="stats-readout"></span></div>
+    <div class="graph-foot"><div class="readouts"><span class="stats-readout"></span><span class="fit-readout"></span></div></div>
     <details class="adv">
       <summary>More options</summary>
       <div class="graph-head">
@@ -1599,6 +1650,19 @@ function nearestFrameForPixelX(g, canvas, cssX) {
 }
 function extent(arr) { return [Math.min(...arr), Math.max(...arr)]; }
 
+// The two ROI bounds are set independently (drag sets both together, but
+// the advanced numeric fields can set just one), so only sort them when
+// both are actually numbers — a lone bound still means "from here to the
+// end" / "from the start to here" as before. This is what makes dragging
+// right-to-left behave the same as left-to-right.
+function orderedRoi(g) {
+  const hasMin = g.roiMin !== null, hasMax = g.roiMax !== null;
+  let lo = hasMin ? g.roiMin : -Infinity;
+  let hi = hasMax ? g.roiMax : Infinity;
+  if (hasMin && hasMax && lo > hi) { const t = lo; lo = hi; hi = t; }
+  return { lo, hi, hasRoi: hasMin || hasMax };
+}
+
 const GRAPH_TITLE_BAND_H = 26; // css px reserved at the top for opts.title (export only)
 function drawGraph(g, canvas, opts) {
   opts = opts || {};
@@ -1618,6 +1682,8 @@ function drawGraph(g, canvas, opts) {
     ctx.fillStyle = getCss('--text-faint'); ctx.font = "12px 'IBM Plex Sans', sans-serif"; ctx.textAlign = 'left';
     ctx.fillText('No data points yet', 12, titleH + (h - titleH) / 2);
     if (statsEl) statsEl.textContent = '';
+    const fr = document.querySelector(`.graph-card[data-id="${g.id}"] .fit-readout`);
+    if (fr) fr.textContent = '';
     return;
   }
   const { track, pts } = gs;
@@ -1663,8 +1729,8 @@ function drawGraph(g, canvas, opts) {
   ctx.textAlign = 'left';
 
   // ROI shading
-  const roiMin = g.roiMin ?? -Infinity, roiMax = g.roiMax ?? Infinity;
-  const hasRoi = g.roiMin !== null || g.roiMax !== null;
+  const roi = orderedRoi(g);
+  const roiMin = roi.lo, roiMax = roi.hi, hasRoi = roi.hasRoi;
   if (hasRoi) {
     const inRoiPts = pts.filter((p) => p.frame >= roiMin && p.frame <= roiMax);
     if (inRoiPts.length) {
@@ -1689,21 +1755,23 @@ function drawGraph(g, canvas, opts) {
   });
   ctx.globalAlpha = 1;
 
-  // fit (optional, from "More options") — the curve is still drawn as a visual
-  // aid, but its algebraic equation is no longer printed; the readout below
-  // is now dedicated to the drag-selected average velocity/acceleration.
+  // fit (optional, from "More options") — draws the curve, and when a fit
+  // type is actually selected, also reports its equation on its own line
+  // below the drag-selected average velocity/acceleration.
+  const fitReadoutEl = document.querySelector(`.graph-card[data-id="${g.id}"] .fit-readout`);
   if (g.fit !== 'none') {
     const fitPts = pts.filter((p) => !hasRoi || (p.frame >= roiMin && p.frame <= roiMax));
     if (fitPts.length >= 2) {
       const xs = fitPts.map((p) => p.x), ys = fitPts.map((p) => p.y);
-      let result = null;
+      let result = null, label = '';
+      const symY = eqSym(track, g.yKey), symX = eqSym(track, g.xKey);
       try {
-        if (g.fit === 'linear') { result = polyFit(xs, ys, 1); }
-        else if (g.fit === 'quadratic') { result = polyFit(xs, ys, 2); }
-        else if (g.fit === 'cubic') { result = polyFit(xs, ys, 3); }
-        else if (g.fit === 'sinusoidal') { result = sinFit(xs, ys, g.seedFreq); }
-        else if (g.fit === 'auto') { result = bestPolyFit(xs, ys, 3); }
-      } catch (e) { result = null; }
+        if (g.fit === 'linear') { result = polyFit(xs, ys, 1); label = `${symY} = ${sig(result.coeffs[1])}${symX} + ${sig(result.coeffs[0])}`; }
+        else if (g.fit === 'quadratic') { result = polyFit(xs, ys, 2); label = `${symY} = ${sig(result.coeffs[2])}${symX}² + ${sig(result.coeffs[1])}${symX} + ${sig(result.coeffs[0])}`; }
+        else if (g.fit === 'cubic') { result = polyFit(xs, ys, 3); label = `${symY} = ${sig(result.coeffs[3])}${symX}³ + ${sig(result.coeffs[2])}${symX}² + ${sig(result.coeffs[1])}${symX} + ${sig(result.coeffs[0])}`; }
+        else if (g.fit === 'sinusoidal') { result = sinFit(xs, ys, g.seedFreq); label = `${symY} = ${sig(result.A)}·sin(${sig(result.w)}${symX} + ${sig(result.phi)}) + ${sig(result.C)}   (f = ${sig(result.freqHz)})`; }
+        else if (g.fit === 'auto') { result = bestPolyFit(xs, ys, 3); label = result ? `best fit (degree ${result.degree}): ` + polyLabel(result, symX, symY) : 'not enough points'; }
+      } catch (e) { result = null; label = 'fit failed to converge'; }
       if (result) {
         ctx.strokeStyle = getCss('--amber'); ctx.lineWidth = 2; ctx.setLineDash([]);
         ctx.beginPath();
@@ -1716,30 +1784,38 @@ function drawGraph(g, canvas, opts) {
           if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
         }
         ctx.stroke();
-      }
-    }
-  }
+        if (fitReadoutEl) fitReadoutEl.textContent = 'Fit: ' + label + '   R² = ' + result.r2.toFixed(4);
+      } else if (fitReadoutEl) { fitReadoutEl.textContent = 'Fit: ' + label; }
+    } else if (fitReadoutEl) { fitReadoutEl.textContent = 'Pick a fit — need at least 2 points in range'; }
+  } else if (fitReadoutEl) { fitReadoutEl.textContent = ''; }
   if (statsEl) statsEl.textContent = regionStatsText(g);
 }
 
-// Average velocity/acceleration over the currently selected (dragged) part
-// of the graph — a straightforward secant-slope calculation over the raw
-// track data, independent of whatever curve fit (if any) is drawn above.
-// Reported component follows whatever's plotted: sideways (x/vx/ax),
-// up/down (y/vy/ay), or overall speed/acceleration magnitude otherwise.
+// Average velocity/acceleration for either the whole clip (no selection) or
+// the currently dragged part of the graph — a straightforward secant-slope
+// calculation over the raw track data, independent of whatever curve fit
+// (if any) is drawn above. Reported component follows whatever's plotted:
+// sideways (x/vx/ax), up/down (y/vy/ay), or overall speed/acceleration
+// magnitude otherwise. Drag direction doesn't matter — orderedRoi() sorts
+// the two bounds whenever both are set.
 function regionStatsText(g) {
   const gs = graphSeries(g);
   if (!gs || !gs.pts.length) return 'No points marked yet.';
-  const hasRoi = g.roiMin !== null && g.roiMax !== null && g.roiMin !== g.roiMax;
-  if (!hasRoi) return 'Drag across the graph to see the average velocity and acceleration for that part.';
   const { series, track } = gs;
-  const roiMin = Math.min(g.roiMin, g.roiMax), roiMax = Math.max(g.roiMin, g.roiMax);
-  const idxs = [];
-  series.frames.forEach((f, i) => { if (f >= roiMin && f <= roiMax) idxs.push(i); });
-  if (idxs.length < 2) return 'Drag across a bigger part of the graph — need at least 2 marked points.';
-  const i0 = idxs[0], i1 = idxs[idxs.length - 1];
+  const roi = orderedRoi(g);
+  const hasSelection = roi.hasRoi && Number.isFinite(roi.lo) && Number.isFinite(roi.hi) && roi.lo !== roi.hi;
+  let i0, i1;
+  if (hasSelection) {
+    const idxs = [];
+    series.frames.forEach((f, i) => { if (f >= roi.lo && f <= roi.hi) idxs.push(i); });
+    if (idxs.length < 2) return 'Drag across a bigger part of the graph — need at least 2 marked points.';
+    i0 = idxs[0]; i1 = idxs[idxs.length - 1];
+  } else {
+    if (series.frames.length < 2) return 'Mark at least 2 points to see average velocity and acceleration.';
+    i0 = 0; i1 = series.frames.length - 1;
+  }
   const dt = series.t[i1] - series.t[i0];
-  if (!(dt > 0)) return 'Drag across a bigger part of the graph.';
+  if (!(dt > 0)) return 'Mark points at different times to see average velocity and acceleration.';
   const uV = columnUnitSuffix(track, 'vx'), uA = columnUnitSuffix(track, 'ax');
   const key = g.yKey;
   let avgV, avgA, vLabel;
@@ -1756,9 +1832,11 @@ function regionStatsText(g) {
     const avgAx = (series.vx[i1] - series.vx[i0]) / dt, avgAy = (series.vy[i1] - series.vy[i0]) / dt;
     avgV = Math.hypot(avgVx, avgVy);
     avgA = Math.hypot(avgAx, avgAy);
-    vLabel = 'Average speed';
+    vLabel = 'Average speed (overall)';
   }
-  return `${vLabel}: ${fmtStat(avgV)} ${uV}   ·   Average acceleration: ${fmtStat(avgA)} ${uA}`;
+  const scope = hasSelection ? 'selected part' : 'whole clip';
+  const hint = hasSelection ? '' : '  ·  drag across the graph to check just part of it';
+  return `${vLabel} (${scope}): ${fmtStat(avgV)} ${uV}   ·   Average acceleration: ${fmtStat(avgA)} ${uA}${hint}`;
 }
 function fmtStat(v) { return Number.isFinite(v) ? v.toFixed(Math.abs(v) < 10 ? 3 : 2) : '—'; }
 function polyLabel(r, symX, symY) {
@@ -1871,12 +1949,20 @@ async function snapshotFrame() {
    SECTION: MISC UI WIRING (tabs, theme, toast, mode buttons)
    ====================================================================== */
 // ---- Tabs ----
+// Switching tabs now also switches mode — the whole point of visiting the
+// Ruler or Track tab is almost always to go tap the video, so it happens
+// automatically instead of needing a second click at the top. Data/Graph
+// don't involve tapping the video, so they fall back to "Look" mode, which
+// also guards against an accidental mark landing on the video while
+// reviewing numbers or a graph.
+const TAB_DEFAULT_MODE = { calibration: 'calibrate', tracks: 'track', data: 'select', graphs: 'select' };
 document.querySelectorAll('#tabBar .tab').forEach((tab) => {
   tab.addEventListener('click', () => {
     document.querySelectorAll('#tabBar .tab').forEach((t) => t.classList.remove('active'));
     document.querySelectorAll('.tab-content').forEach((c) => c.classList.remove('active'));
     tab.classList.add('active');
     $('tab-' + tab.dataset.tab).classList.add('active');
+    setMode(TAB_DEFAULT_MODE[tab.dataset.tab] || 'select');
   });
 });
 
